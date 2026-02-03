@@ -14,12 +14,24 @@ Usage:
         --chunk_size 500
 
 For long videos, the script processes in chunks to manage memory efficiently.
+
+Examples:
+    # Process first 400 frames only
+    python scripts/process_video.py --video_path video.mp4 --output_dir out --text_prompt "lion" --max_frames 400
+
+    # Process every 3rd frame (reduce frame rate by 3x)
+    python scripts/process_video.py --video_path video.mp4 --output_dir out --text_prompt "lion" --frame_stride 3
+
+    # Combine both: every 2nd frame, max 500 frames
+    python scripts/process_video.py --video_path video.mp4 --output_dir out --text_prompt "lion" --frame_stride 2 --max_frames 500
 """
 
 import argparse
 import json
 import os
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 import cv2
@@ -94,12 +106,101 @@ def parse_args():
         default=False,
         help="Offload video frames and state to CPU (slower but uses less GPU memory)",
     )
+    parser.add_argument(
+        "--max_frames",
+        type=int,
+        default=None,
+        help="Maximum number of frames to process. If None, processes all frames.",
+    )
+    parser.add_argument(
+        "--frame_stride",
+        type=int,
+        default=1,
+        help="Process every Nth frame (default: 1 = all frames). "
+        "Use 2 to halve frame rate, 3 to reduce by 3x, etc.",
+    )
     return parser.parse_args()
+
+
+def extract_frames_to_folder(
+    video_path: str,
+    output_folder: str,
+    frame_stride: int = 1,
+    max_frames: int = None,
+):
+    """
+    Extract frames from video to a JPEG folder with optional stride and frame limit.
+
+    Args:
+        video_path: Path to input video file
+        output_folder: Path to output folder for JPEG frames
+        frame_stride: Extract every Nth frame (1 = all frames)
+        max_frames: Maximum number of frames to extract (None = no limit)
+
+    Returns:
+        dict with extraction info: num_frames, original_fps, effective_fps, frame_indices
+    """
+    os.makedirs(output_folder, exist_ok=True)
+
+    cap = cv2.VideoCapture(video_path)
+    original_fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    # Calculate which frames to extract
+    frame_indices = list(range(0, total_frames, frame_stride))
+    if max_frames is not None and len(frame_indices) > max_frames:
+        frame_indices = frame_indices[:max_frames]
+
+    print(f"\nExtracting frames from video...")
+    print(f"  - Original: {total_frames} frames @ {original_fps:.1f} FPS")
+    print(f"  - Stride: every {frame_stride} frame(s)")
+    print(f"  - Extracting: {len(frame_indices)} frames")
+
+    effective_fps = original_fps / frame_stride
+
+    extracted_count = 0
+    frame_idx = 0
+
+    # Map from extracted index to original frame index
+    index_mapping = {}
+
+    with tqdm(total=len(frame_indices), desc="Extracting frames") as pbar:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            if frame_idx in frame_indices:
+                # Save frame with sequential numbering (SAM3 expects this)
+                output_path = os.path.join(output_folder, f"{extracted_count:06d}.jpg")
+                cv2.imwrite(output_path, frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                index_mapping[extracted_count] = frame_idx
+                extracted_count += 1
+                pbar.update(1)
+
+                if max_frames is not None and extracted_count >= max_frames:
+                    break
+
+            frame_idx += 1
+
+    cap.release()
+
+    return {
+        "num_frames": extracted_count,
+        "original_fps": original_fps,
+        "effective_fps": effective_fps,
+        "width": width,
+        "height": height,
+        "frame_indices": frame_indices[:extracted_count],
+        "index_mapping": index_mapping,
+    }
 
 
 def get_video_info(video_path: str):
     """Get video information (frame count, fps, dimensions)."""
-    if video_path.endswith(".mp4") or video_path.endswith((".mov", ".avi", ".mkv", ".webm")):
+    if video_path.endswith((".mp4", ".MP4", ".mov", ".MOV", ".avi", ".AVI", ".mkv", ".MKV", ".webm", ".WEBM")):
         cap = cv2.VideoCapture(video_path)
         frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         fps = cap.get(cv2.CAP_PROP_FPS)
@@ -124,7 +225,8 @@ def get_video_info(video_path: str):
 
 def load_video_frames(video_path: str):
     """Load video frames for visualization."""
-    if video_path.endswith((".mp4", ".mov", ".avi", ".mkv", ".webm")):
+    video_extensions = (".mp4", ".MP4", ".mov", ".MOV", ".avi", ".AVI", ".mkv", ".MKV", ".webm", ".WEBM")
+    if video_path.endswith(video_extensions):
         cap = cv2.VideoCapture(video_path)
         frames = []
         while True:
@@ -203,12 +305,17 @@ def process_video_in_chunks(
     save_masks: bool = True,
     save_visualizations: bool = True,
     offload_to_cpu: bool = False,
+    index_mapping: dict = None,
 ):
     """
     Process video in chunks and save results.
 
     For long videos, this processes the video in manageable chunks to avoid
     running out of GPU memory.
+
+    Args:
+        index_mapping: Optional dict mapping extracted frame indices to original frame indices.
+                       Used when frames were extracted with stride/limit.
     """
     # Get video info
     video_info = get_video_info(video_path)
@@ -312,16 +419,19 @@ def process_video_in_chunks(
                 # Convert logits to binary masks
                 masks = (out_mask_logits > 0).cpu().numpy()
 
+                # Get the original frame index for saving (if using stride/limit)
+                save_frame_idx = index_mapping.get(frame_idx, frame_idx) if index_mapping else frame_idx
+
                 # Save individual masks
                 if save_masks:
                     for obj_id, mask in zip(out_obj_ids, masks):
-                        save_mask(mask, obj_id, frame_idx, output_dir)
+                        save_mask(mask, obj_id, save_frame_idx, output_dir)
 
                 # Save visualization
                 if save_visualizations:
                     frame = video_frames[frame_idx]
                     vis_frame = overlay_masks_on_frame(frame, masks, out_obj_ids, colors)
-                    vis_path = os.path.join(output_dir, "visualizations", f"frame_{frame_idx:06d}.jpg")
+                    vis_path = os.path.join(output_dir, "visualizations", f"frame_{save_frame_idx:06d}.jpg")
                     Image.fromarray(vis_frame).save(vis_path, quality=95)
 
     # Save metadata
@@ -400,6 +510,32 @@ def main():
 
     print(f"Using GPUs: {gpus_to_use}")
 
+    # Check if we need to extract frames (stride > 1 or max_frames specified)
+    need_extraction = args.frame_stride > 1 or args.max_frames is not None
+    temp_dir = None
+    video_path_to_use = args.video_path
+    index_mapping = None
+    effective_fps = None
+
+    video_extensions = (".mp4", ".MP4", ".mov", ".MOV", ".avi", ".AVI", ".mkv", ".MKV", ".webm", ".WEBM")
+    if need_extraction and args.video_path.endswith(video_extensions):
+        # Create temp directory for extracted frames
+        temp_dir = tempfile.mkdtemp(prefix="sam3_frames_")
+        print(f"\nExtracting frames to temporary folder: {temp_dir}")
+
+        extraction_info = extract_frames_to_folder(
+            video_path=args.video_path,
+            output_folder=temp_dir,
+            frame_stride=args.frame_stride,
+            max_frames=args.max_frames,
+        )
+
+        video_path_to_use = temp_dir
+        index_mapping = extraction_info["index_mapping"]
+        effective_fps = extraction_info["effective_fps"]
+
+        print(f"  - Effective FPS: {effective_fps:.1f}")
+
     # Build predictor
     print("\nBuilding SAM3 video predictor...")
     from sam3.model_builder import build_sam3_video_predictor
@@ -410,7 +546,7 @@ def main():
         # Process video
         outputs, metadata = process_video_in_chunks(
             predictor=predictor,
-            video_path=args.video_path,
+            video_path=video_path_to_use,
             output_dir=args.output_dir,
             text_prompt=args.text_prompt,
             chunk_size=args.chunk_size,
@@ -418,17 +554,35 @@ def main():
             save_masks=args.save_masks,
             save_visualizations=args.save_visualizations,
             offload_to_cpu=args.offload_to_cpu,
+            index_mapping=index_mapping,
         )
 
+        # Update metadata with extraction info
+        if need_extraction:
+            metadata["frame_stride"] = args.frame_stride
+            metadata["max_frames"] = args.max_frames
+            metadata["effective_fps"] = effective_fps
+            metadata["original_video_path"] = args.video_path
+
+            # Re-save metadata
+            metadata_path = os.path.join(args.output_dir, "metadata.json")
+            with open(metadata_path, "w") as f:
+                json.dump(metadata, f, indent=2)
+
         # Create output video if requested
+        output_fps = effective_fps if effective_fps else metadata["fps"]
         if args.save_video:
-            create_output_video(args.output_dir, fps=metadata["fps"])
+            create_output_video(args.output_dir, fps=output_fps)
 
         print(f"\n{'='*50}")
         print("Processing complete!")
         print(f"{'='*50}")
         print(f"Output directory: {args.output_dir}")
         print(f"Frames processed: {metadata['frames_processed']}")
+        if args.frame_stride > 1:
+            print(f"Frame stride: {args.frame_stride} (every {args.frame_stride} frames)")
+        if args.max_frames:
+            print(f"Max frames limit: {args.max_frames}")
         print(f"Objects tracked: {len(metadata['objects_found'])}")
         if args.save_masks:
             print(f"Masks saved to: {os.path.join(args.output_dir, 'masks')}")
@@ -441,6 +595,11 @@ def main():
         # Clean up
         print("\nShutting down predictor...")
         predictor.shutdown()
+
+        # Clean up temp directory
+        if temp_dir and os.path.exists(temp_dir):
+            print(f"Cleaning up temp directory: {temp_dir}")
+            shutil.rmtree(temp_dir)
 
 
 if __name__ == "__main__":
