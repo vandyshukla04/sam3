@@ -284,7 +284,9 @@ def overlay_masks_on_frame(frame, masks, obj_ids, colors, alpha=0.5):
 
 def save_mask(mask, obj_id, frame_idx, output_dir):
     """Save a single mask as PNG."""
-    mask_dir = os.path.join(output_dir, "masks", f"obj_{obj_id}")
+    # Convert obj_id if it's a tensor
+    obj_id_val = int(obj_id.item()) if hasattr(obj_id, 'item') else int(obj_id)
+    mask_dir = os.path.join(output_dir, "masks", f"obj_{obj_id_val}")
     os.makedirs(mask_dir, exist_ok=True)
 
     if mask.ndim > 2:
@@ -414,24 +416,27 @@ def process_video_in_chunks(
             outputs = response["outputs"]
             all_outputs[frame_idx] = outputs
 
-            # Get masks and object IDs
-            out_mask_logits = outputs.get("out_mask_logits", None)
-            out_obj_ids = outputs.get("out_obj_ids", [])
+            # Get masks and object IDs (correct keys from SAM3 output)
+            out_binary_masks = outputs.get("out_binary_masks", None)
+            out_obj_ids = outputs.get("out_obj_ids", None)
 
             # Get the original frame index for saving (if using stride/limit)
             save_frame_idx = index_mapping.get(frame_idx, frame_idx) if index_mapping else frame_idx
 
             # Track detections
-            num_objects_this_frame = len(out_obj_ids) if out_obj_ids is not None else 0
-            if num_objects_this_frame > 0:
-                frames_with_detections += 1
-                total_detections += num_objects_this_frame
-                for oid in out_obj_ids:
-                    all_obj_ids_seen.add(int(oid) if hasattr(oid, 'item') else oid)
+            has_detections = (out_obj_ids is not None and len(out_obj_ids) > 0 and
+                              out_binary_masks is not None and len(out_binary_masks) > 0)
 
-            if out_mask_logits is not None and len(out_obj_ids) > 0:
-                # Convert logits to binary masks
-                masks = (out_mask_logits > 0).cpu().numpy()
+            if has_detections:
+                frames_with_detections += 1
+                total_detections += len(out_obj_ids)
+                for oid in out_obj_ids:
+                    oid_val = int(oid.item()) if hasattr(oid, 'item') else int(oid)
+                    all_obj_ids_seen.add(oid_val)
+
+            if has_detections:
+                # Masks are already binary from SAM3
+                masks = out_binary_masks.cpu().numpy() if hasattr(out_binary_masks, 'cpu') else out_binary_masks
 
                 # Save individual masks
                 if save_masks:
