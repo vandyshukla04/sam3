@@ -24,6 +24,9 @@ Examples:
 
     # Combine both: every 2nd frame, max 500 frames
     python scripts/process_video.py --video_path video.mp4 --output_dir out --text_prompt "lion" --frame_stride 2 --max_frames 500
+
+    # Track multiple object types
+    python scripts/process_video.py --video_path video.mp4 --output_dir out --text_prompt "lion" "jackal" "buffalo"
 """
 
 import argparse
@@ -60,8 +63,9 @@ def parse_args():
     parser.add_argument(
         "--text_prompt",
         type=str,
-        default="person",
-        help="Text prompt describing objects to segment (e.g., 'person', 'car', 'dog')",
+        nargs="+",
+        default=["person"],
+        help="Text prompts describing objects to segment (e.g., 'lion' 'jackal' 'buffalo')",
     )
     parser.add_argument(
         "--chunk_size",
@@ -324,11 +328,17 @@ def process_video_in_chunks(
     total_frames = video_info["frame_count"]
     fps = video_info["fps"]
 
+    # Normalize text_prompt to a list
+    if isinstance(text_prompt, str):
+        text_prompts = [text_prompt]
+    else:
+        text_prompts = list(text_prompt)
+
     print(f"\nVideo Info:")
     print(f"  - Total frames: {total_frames}")
     print(f"  - FPS: {fps}")
     print(f"  - Resolution: {video_info['width']}x{video_info['height']}")
-    print(f"  - Text prompt: '{text_prompt}'")
+    print(f"  - Text prompts: {text_prompts}")
 
     if chunk_size is None:
         chunk_size = total_frames
@@ -364,20 +374,23 @@ def process_video_in_chunks(
     )
     session_id = response["session_id"]
 
-    # Add text prompt
-    print(f"Adding text prompt on frame {prompt_frame}...")
-    response = predictor.handle_request(
-        request=dict(
-            type="add_prompt",
-            session_id=session_id,
-            frame_index=prompt_frame,
-            text=text_prompt,
+    # Add text prompts for each object type
+    obj_ids_found = []
+    for prompt in text_prompts:
+        print(f"Adding text prompt '{prompt}' on frame {prompt_frame}...")
+        response = predictor.handle_request(
+            request=dict(
+                type="add_prompt",
+                session_id=session_id,
+                frame_index=prompt_frame,
+                text=prompt,
+            )
         )
-    )
 
-    initial_objects = response.get("outputs", {})
-    obj_ids_found = list(initial_objects.get("obj_ids", []))
-    print(f"Found {len(obj_ids_found)} objects on prompt frame")
+        initial_objects = response.get("outputs", {})
+        prompt_obj_ids = list(initial_objects.get("obj_ids", []))
+        obj_ids_found.extend(prompt_obj_ids)
+        print(f"  Found {len(prompt_obj_ids)} objects for '{prompt}'")
 
     # Process in chunks
     all_outputs = {}
@@ -466,13 +479,13 @@ def process_video_in_chunks(
     print(f"  - Object IDs: {sorted(all_obj_ids_seen) if all_obj_ids_seen else 'None'}")
     if frames_with_detections == 0:
         print(f"\n  ⚠️  NO OBJECTS DETECTED!")
-        print(f"  Try different prompts: 'lion', 'animal', 'cat', or 'wildlife'")
+        print(f"  Try different prompts or more generic terms like 'animal' or 'wildlife'")
         print(f"  Or try a different --prompt_frame (e.g., 50, 100)")
 
     # Save metadata
     metadata = {
         "video_path": video_path,
-        "text_prompt": text_prompt,
+        "text_prompts": text_prompts,
         "total_frames": total_frames,
         "fps": fps,
         "resolution": [video_info["width"], video_info["height"]],
