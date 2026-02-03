@@ -379,6 +379,9 @@ def process_video_in_chunks(
 
     # Process in chunks
     all_outputs = {}
+    total_detections = 0
+    frames_with_detections = 0
+    all_obj_ids_seen = set()
 
     # Calculate chunks
     chunks = []
@@ -415,24 +418,51 @@ def process_video_in_chunks(
             out_mask_logits = outputs.get("out_mask_logits", None)
             out_obj_ids = outputs.get("out_obj_ids", [])
 
+            # Get the original frame index for saving (if using stride/limit)
+            save_frame_idx = index_mapping.get(frame_idx, frame_idx) if index_mapping else frame_idx
+
+            # Track detections
+            num_objects_this_frame = len(out_obj_ids) if out_obj_ids is not None else 0
+            if num_objects_this_frame > 0:
+                frames_with_detections += 1
+                total_detections += num_objects_this_frame
+                for oid in out_obj_ids:
+                    all_obj_ids_seen.add(int(oid) if hasattr(oid, 'item') else oid)
+
             if out_mask_logits is not None and len(out_obj_ids) > 0:
                 # Convert logits to binary masks
                 masks = (out_mask_logits > 0).cpu().numpy()
-
-                # Get the original frame index for saving (if using stride/limit)
-                save_frame_idx = index_mapping.get(frame_idx, frame_idx) if index_mapping else frame_idx
 
                 # Save individual masks
                 if save_masks:
                     for obj_id, mask in zip(out_obj_ids, masks):
                         save_mask(mask, obj_id, save_frame_idx, output_dir)
 
-                # Save visualization
+                # Save visualization with masks
                 if save_visualizations:
                     frame = video_frames[frame_idx]
                     vis_frame = overlay_masks_on_frame(frame, masks, out_obj_ids, colors)
                     vis_path = os.path.join(output_dir, "visualizations", f"frame_{save_frame_idx:06d}.jpg")
                     Image.fromarray(vis_frame).save(vis_path, quality=95)
+            elif save_visualizations:
+                # Save frame without masks (no objects detected)
+                frame = video_frames[frame_idx]
+                if isinstance(frame, str):
+                    frame = np.array(Image.open(frame))
+                vis_path = os.path.join(output_dir, "visualizations", f"frame_{save_frame_idx:06d}.jpg")
+                Image.fromarray(frame).save(vis_path, quality=95)
+
+    # Print detection summary
+    print(f"\n{'='*50}")
+    print("Detection Summary:")
+    print(f"{'='*50}")
+    print(f"  - Frames with detections: {frames_with_detections}/{len(all_outputs)}")
+    print(f"  - Unique objects tracked: {len(all_obj_ids_seen)}")
+    print(f"  - Object IDs: {sorted(all_obj_ids_seen) if all_obj_ids_seen else 'None'}")
+    if frames_with_detections == 0:
+        print(f"\n  ⚠️  NO OBJECTS DETECTED!")
+        print(f"  Try different prompts: 'lion', 'animal', 'cat', or 'wildlife'")
+        print(f"  Or try a different --prompt_frame (e.g., 50, 100)")
 
     # Save metadata
     metadata = {
@@ -444,6 +474,9 @@ def process_video_in_chunks(
         "chunk_size": chunk_size if chunk_size != total_frames else None,
         "objects_found": obj_ids_found,
         "frames_processed": len(all_outputs),
+        "frames_with_detections": frames_with_detections,
+        "unique_objects_tracked": len(all_obj_ids_seen),
+        "object_ids": sorted(all_obj_ids_seen) if all_obj_ids_seen else [],
     }
 
     metadata_path = os.path.join(output_dir, "metadata.json")
