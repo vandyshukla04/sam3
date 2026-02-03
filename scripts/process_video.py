@@ -1,0 +1,447 @@
+#!/usr/bin/env python3
+# Copyright (c) Meta Platforms, Inc. and affiliates. All Rights Reserved
+
+"""
+SAM3 Video Processing Script
+
+Process videos (including long ones in chunks) with SAM3 and save segmentation results.
+
+Usage:
+    python scripts/process_video.py \
+        --video_path /path/to/video.mp4 \
+        --output_dir /path/to/output \
+        --text_prompt "person" \
+        --chunk_size 500
+
+For long videos, the script processes in chunks to manage memory efficiently.
+"""
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+import cv2
+import numpy as np
+import torch
+from PIL import Image
+from tqdm import tqdm
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Process video with SAM3 and save segmentation results"
+    )
+    parser.add_argument(
+        "--video_path",
+        type=str,
+        required=True,
+        help="Path to input video file (.mp4) or JPEG frame folder",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        required=True,
+        help="Directory to save output results",
+    )
+    parser.add_argument(
+        "--text_prompt",
+        type=str,
+        default="person",
+        help="Text prompt describing objects to segment (e.g., 'person', 'car', 'dog')",
+    )
+    parser.add_argument(
+        "--chunk_size",
+        type=int,
+        default=None,
+        help="Number of frames to process per chunk. If None, processes entire video at once. "
+        "Use smaller values (e.g., 200-500) for long videos to manage memory.",
+    )
+    parser.add_argument(
+        "--prompt_frame",
+        type=int,
+        default=0,
+        help="Frame index to add the text prompt on (default: 0)",
+    )
+    parser.add_argument(
+        "--save_masks",
+        action="store_true",
+        default=True,
+        help="Save binary masks as PNG files",
+    )
+    parser.add_argument(
+        "--save_visualizations",
+        action="store_true",
+        default=True,
+        help="Save visualization images with masks overlaid",
+    )
+    parser.add_argument(
+        "--save_video",
+        action="store_true",
+        default=False,
+        help="Save output as a video file with masks overlaid",
+    )
+    parser.add_argument(
+        "--gpus",
+        type=str,
+        default=None,
+        help="Comma-separated GPU indices to use (e.g., '0,1,2'). Default: all available",
+    )
+    parser.add_argument(
+        "--offload_to_cpu",
+        action="store_true",
+        default=False,
+        help="Offload video frames and state to CPU (slower but uses less GPU memory)",
+    )
+    return parser.parse_args()
+
+
+def get_video_info(video_path: str):
+    """Get video information (frame count, fps, dimensions)."""
+    if video_path.endswith(".mp4") or video_path.endswith((".mov", ".avi", ".mkv", ".webm")):
+        cap = cv2.VideoCapture(video_path)
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        cap.release()
+        return {"frame_count": frame_count, "fps": fps, "width": width, "height": height}
+    else:
+        # JPEG folder
+        import glob
+        frames = glob.glob(os.path.join(video_path, "*.jpg"))
+        if not frames:
+            frames = glob.glob(os.path.join(video_path, "*.png"))
+        frame_count = len(frames)
+        if frame_count > 0:
+            img = Image.open(frames[0])
+            width, height = img.size
+        else:
+            width, height = 0, 0
+        return {"frame_count": frame_count, "fps": 30, "width": width, "height": height}
+
+
+def load_video_frames(video_path: str):
+    """Load video frames for visualization."""
+    if video_path.endswith((".mp4", ".mov", ".avi", ".mkv", ".webm")):
+        cap = cv2.VideoCapture(video_path)
+        frames = []
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        cap.release()
+        return frames
+    else:
+        import glob
+        frame_paths = glob.glob(os.path.join(video_path, "*.jpg"))
+        if not frame_paths:
+            frame_paths = glob.glob(os.path.join(video_path, "*.png"))
+        try:
+            frame_paths.sort(key=lambda p: int(os.path.splitext(os.path.basename(p))[0]))
+        except ValueError:
+            frame_paths.sort()
+        return frame_paths
+
+
+def create_color_map(num_objects: int):
+    """Create distinct colors for different object IDs."""
+    np.random.seed(42)
+    colors = {}
+    for i in range(num_objects + 10):  # Extra colors for safety
+        colors[i] = tuple(np.random.randint(50, 255, 3).tolist())
+    return colors
+
+
+def overlay_masks_on_frame(frame, masks, obj_ids, colors, alpha=0.5):
+    """Overlay segmentation masks on a frame."""
+    if isinstance(frame, str):
+        frame = np.array(Image.open(frame))
+
+    overlay = frame.copy()
+
+    for obj_id, mask in zip(obj_ids, masks):
+        if obj_id not in colors:
+            colors[obj_id] = tuple(np.random.randint(50, 255, 3).tolist())
+        color = colors[obj_id]
+
+        # Ensure mask is 2D
+        if mask.ndim > 2:
+            mask = mask.squeeze()
+
+        # Create colored mask
+        mask_bool = mask > 0
+        overlay[mask_bool] = (
+            np.array(color) * alpha + overlay[mask_bool] * (1 - alpha)
+        ).astype(np.uint8)
+
+    return overlay
+
+
+def save_mask(mask, obj_id, frame_idx, output_dir):
+    """Save a single mask as PNG."""
+    mask_dir = os.path.join(output_dir, "masks", f"obj_{obj_id}")
+    os.makedirs(mask_dir, exist_ok=True)
+
+    if mask.ndim > 2:
+        mask = mask.squeeze()
+
+    mask_uint8 = (mask > 0).astype(np.uint8) * 255
+    mask_path = os.path.join(mask_dir, f"frame_{frame_idx:06d}.png")
+    cv2.imwrite(mask_path, mask_uint8)
+
+
+def process_video_in_chunks(
+    predictor,
+    video_path: str,
+    output_dir: str,
+    text_prompt: str,
+    chunk_size: int = None,
+    prompt_frame: int = 0,
+    save_masks: bool = True,
+    save_visualizations: bool = True,
+    offload_to_cpu: bool = False,
+):
+    """
+    Process video in chunks and save results.
+
+    For long videos, this processes the video in manageable chunks to avoid
+    running out of GPU memory.
+    """
+    # Get video info
+    video_info = get_video_info(video_path)
+    total_frames = video_info["frame_count"]
+    fps = video_info["fps"]
+
+    print(f"\nVideo Info:")
+    print(f"  - Total frames: {total_frames}")
+    print(f"  - FPS: {fps}")
+    print(f"  - Resolution: {video_info['width']}x{video_info['height']}")
+    print(f"  - Text prompt: '{text_prompt}'")
+
+    if chunk_size is None:
+        chunk_size = total_frames
+        print(f"  - Processing: entire video at once")
+    else:
+        num_chunks = (total_frames + chunk_size - 1) // chunk_size
+        print(f"  - Chunk size: {chunk_size} frames")
+        print(f"  - Number of chunks: {num_chunks}")
+
+    # Create output directories
+    os.makedirs(output_dir, exist_ok=True)
+    if save_masks:
+        os.makedirs(os.path.join(output_dir, "masks"), exist_ok=True)
+    if save_visualizations:
+        os.makedirs(os.path.join(output_dir, "visualizations"), exist_ok=True)
+
+    # Load frames for visualization
+    print("\nLoading video frames for visualization...")
+    video_frames = load_video_frames(video_path)
+
+    # Color map for objects
+    colors = create_color_map(100)
+
+    # Start session
+    print("\nStarting SAM3 session...")
+    response = predictor.handle_request(
+        request=dict(
+            type="start_session",
+            resource_path=video_path,
+            offload_video_to_cpu=offload_to_cpu,
+            offload_state_to_cpu=offload_to_cpu,
+        )
+    )
+    session_id = response["session_id"]
+
+    # Add text prompt
+    print(f"Adding text prompt on frame {prompt_frame}...")
+    response = predictor.handle_request(
+        request=dict(
+            type="add_prompt",
+            session_id=session_id,
+            frame_index=prompt_frame,
+            text=text_prompt,
+        )
+    )
+
+    initial_objects = response.get("outputs", {})
+    obj_ids_found = list(initial_objects.get("obj_ids", []))
+    print(f"Found {len(obj_ids_found)} objects on prompt frame")
+
+    # Process in chunks
+    all_outputs = {}
+
+    # Calculate chunks
+    chunks = []
+    start = 0
+    while start < total_frames:
+        end = min(start + chunk_size, total_frames)
+        chunks.append((start, end))
+        start = end
+
+    print(f"\nProcessing video in {len(chunks)} chunk(s)...")
+
+    for chunk_idx, (chunk_start, chunk_end) in enumerate(chunks):
+        chunk_frames = chunk_end - chunk_start
+        print(f"\nChunk {chunk_idx + 1}/{len(chunks)}: frames {chunk_start} to {chunk_end - 1}")
+
+        # Propagate for this chunk
+        for response in tqdm(
+            predictor.handle_stream_request(
+                request=dict(
+                    type="propagate_in_video",
+                    session_id=session_id,
+                    start_frame_index=chunk_start if chunk_idx > 0 else None,
+                    max_frame_num_to_track=chunk_frames,
+                )
+            ),
+            total=chunk_frames,
+            desc=f"Processing chunk {chunk_idx + 1}",
+        ):
+            frame_idx = response["frame_index"]
+            outputs = response["outputs"]
+            all_outputs[frame_idx] = outputs
+
+            # Get masks and object IDs
+            out_mask_logits = outputs.get("out_mask_logits", None)
+            out_obj_ids = outputs.get("out_obj_ids", [])
+
+            if out_mask_logits is not None and len(out_obj_ids) > 0:
+                # Convert logits to binary masks
+                masks = (out_mask_logits > 0).cpu().numpy()
+
+                # Save individual masks
+                if save_masks:
+                    for obj_id, mask in zip(out_obj_ids, masks):
+                        save_mask(mask, obj_id, frame_idx, output_dir)
+
+                # Save visualization
+                if save_visualizations:
+                    frame = video_frames[frame_idx]
+                    vis_frame = overlay_masks_on_frame(frame, masks, out_obj_ids, colors)
+                    vis_path = os.path.join(output_dir, "visualizations", f"frame_{frame_idx:06d}.jpg")
+                    Image.fromarray(vis_frame).save(vis_path, quality=95)
+
+    # Save metadata
+    metadata = {
+        "video_path": video_path,
+        "text_prompt": text_prompt,
+        "total_frames": total_frames,
+        "fps": fps,
+        "resolution": [video_info["width"], video_info["height"]],
+        "chunk_size": chunk_size if chunk_size != total_frames else None,
+        "objects_found": obj_ids_found,
+        "frames_processed": len(all_outputs),
+    }
+
+    metadata_path = os.path.join(output_dir, "metadata.json")
+    with open(metadata_path, "w") as f:
+        json.dump(metadata, f, indent=2)
+
+    print(f"\nSaved metadata to {metadata_path}")
+
+    # Close session
+    predictor.handle_request(
+        request=dict(
+            type="close_session",
+            session_id=session_id,
+        )
+    )
+
+    return all_outputs, metadata
+
+
+def create_output_video(output_dir: str, fps: float = 30.0):
+    """Create a video from visualization frames."""
+    vis_dir = os.path.join(output_dir, "visualizations")
+    if not os.path.exists(vis_dir):
+        print("No visualizations found to create video")
+        return
+
+    import glob
+    frames = sorted(glob.glob(os.path.join(vis_dir, "frame_*.jpg")))
+    if not frames:
+        print("No visualization frames found")
+        return
+
+    # Get frame size from first frame
+    first_frame = cv2.imread(frames[0])
+    height, width = first_frame.shape[:2]
+
+    # Create video writer
+    video_path = os.path.join(output_dir, "output_video.mp4")
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    video_writer = cv2.VideoWriter(video_path, fourcc, fps, (width, height))
+
+    print(f"\nCreating output video: {video_path}")
+    for frame_path in tqdm(frames, desc="Writing video"):
+        frame = cv2.imread(frame_path)
+        video_writer.write(frame)
+
+    video_writer.release()
+    print(f"Video saved to {video_path}")
+
+
+def main():
+    args = parse_args()
+
+    # Validate input
+    if not os.path.exists(args.video_path):
+        print(f"Error: Video path does not exist: {args.video_path}")
+        sys.exit(1)
+
+    # Setup GPUs
+    if args.gpus is not None:
+        gpus_to_use = [int(g) for g in args.gpus.split(",")]
+    else:
+        gpus_to_use = list(range(torch.cuda.device_count()))
+
+    print(f"Using GPUs: {gpus_to_use}")
+
+    # Build predictor
+    print("\nBuilding SAM3 video predictor...")
+    from sam3.model_builder import build_sam3_video_predictor
+
+    predictor = build_sam3_video_predictor(gpus_to_use=gpus_to_use)
+
+    try:
+        # Process video
+        outputs, metadata = process_video_in_chunks(
+            predictor=predictor,
+            video_path=args.video_path,
+            output_dir=args.output_dir,
+            text_prompt=args.text_prompt,
+            chunk_size=args.chunk_size,
+            prompt_frame=args.prompt_frame,
+            save_masks=args.save_masks,
+            save_visualizations=args.save_visualizations,
+            offload_to_cpu=args.offload_to_cpu,
+        )
+
+        # Create output video if requested
+        if args.save_video:
+            create_output_video(args.output_dir, fps=metadata["fps"])
+
+        print(f"\n{'='*50}")
+        print("Processing complete!")
+        print(f"{'='*50}")
+        print(f"Output directory: {args.output_dir}")
+        print(f"Frames processed: {metadata['frames_processed']}")
+        print(f"Objects tracked: {len(metadata['objects_found'])}")
+        if args.save_masks:
+            print(f"Masks saved to: {os.path.join(args.output_dir, 'masks')}")
+        if args.save_visualizations:
+            print(f"Visualizations saved to: {os.path.join(args.output_dir, 'visualizations')}")
+        if args.save_video:
+            print(f"Output video: {os.path.join(args.output_dir, 'output_video.mp4')}")
+
+    finally:
+        # Clean up
+        print("\nShutting down predictor...")
+        predictor.shutdown()
+
+
+if __name__ == "__main__":
+    main()
