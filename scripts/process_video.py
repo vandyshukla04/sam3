@@ -6,6 +6,12 @@ SAM3 Video Processing Script
 
 Process videos (including long ones in chunks) with SAM3 and save segmentation results.
 
+Features:
+- Automatic resume capability: If processing crashes or runs out of memory, re-running
+  the same command will continue from where it left off
+- Prompt-specific subdirectories: Different prompts save to separate folders to avoid conflicts
+- Frame stride support: Process every Nth frame to reduce processing time
+
 Usage:
     python scripts/process_video.py \
         --video_path /path/to/video.mp4 \
@@ -25,8 +31,13 @@ Examples:
     # Combine both: every 2nd frame, max 500 frames
     python scripts/process_video.py --video_path video.mp4 --output_dir out --text_prompt "lion" --frame_stride 2 --max_frames 500
 
-    # Track multiple object types
-    python scripts/process_video.py --video_path video.mp4 --output_dir out --text_prompt "lion" "jackal" "buffalo"
+    # Resume after crash: Just re-run the exact same command
+    python scripts/process_video.py --video_path video.mp4 --output_dir out --text_prompt "zebra" --frame_stride 3
+    # Script will automatically detect existing frames and continue from where it stopped
+
+    # Different prompts save to different folders (won't overwrite)
+    python scripts/process_video.py --video_path video.mp4 --output_dir out --text_prompt "zebra"  # saves to out/zebra/
+    python scripts/process_video.py --video_path video.mp4 --output_dir out --text_prompt "lion"   # saves to out/lion/
 """
 
 import argparse
@@ -63,9 +74,8 @@ def parse_args():
     parser.add_argument(
         "--text_prompt",
         type=str,
-        nargs="+",
-        default=["person"],
-        help="Text prompts describing objects to segment (e.g., 'lion' 'jackal' 'buffalo')",
+        default="person",
+        help="Text prompt describing objects to segment (e.g., 'lion', 'zebra', 'animal')",
     )
     parser.add_argument(
         "--chunk_size",
@@ -301,6 +311,48 @@ def save_mask(mask, obj_id, frame_idx, output_dir):
     cv2.imwrite(mask_path, mask_uint8)
 
 
+def detect_resume_point(output_dir: str, frame_stride: int):
+    """
+    Detect the last processed frame and determine where to resume.
+
+    Returns:
+        dict with keys:
+            - last_frame: last frame index that was processed
+            - existing_frames: set of frame indices that exist
+            - should_resume: whether to resume or start fresh
+    """
+    vis_dir = os.path.join(output_dir, "visualizations")
+    if not os.path.exists(vis_dir):
+        return {"last_frame": None, "existing_frames": set(), "should_resume": False}
+
+    import glob
+    import re
+
+    # Find all existing visualization frames
+    frames = glob.glob(os.path.join(vis_dir, "frame_*.jpg"))
+    if not frames:
+        return {"last_frame": None, "existing_frames": set(), "should_resume": False}
+
+    # Extract frame numbers
+    existing_frames = set()
+    for frame_path in frames:
+        match = re.search(r'frame_(\d+)\.jpg', os.path.basename(frame_path))
+        if match:
+            existing_frames.add(int(match.group(1)))
+
+    if not existing_frames:
+        return {"last_frame": None, "existing_frames": set(), "should_resume": False}
+
+    last_frame = max(existing_frames)
+
+    return {
+        "last_frame": last_frame,
+        "existing_frames": existing_frames,
+        "should_resume": True,
+        "num_existing": len(existing_frames)
+    }
+
+
 def process_video_in_chunks(
     predictor,
     video_path: str,
@@ -312,6 +364,8 @@ def process_video_in_chunks(
     save_visualizations: bool = True,
     offload_to_cpu: bool = False,
     index_mapping: dict = None,
+    frame_stride: int = 1,
+    resume_info: dict = None,
 ):
     """
     Process video in chunks and save results.
@@ -328,17 +382,44 @@ def process_video_in_chunks(
     total_frames = video_info["frame_count"]
     fps = video_info["fps"]
 
-    # Normalize text_prompt to a list
-    if isinstance(text_prompt, str):
-        text_prompts = [text_prompt]
+    # Check for resume
+    should_resume = resume_info and resume_info.get("should_resume", False)
+    if should_resume:
+        last_frame = resume_info["last_frame"]
+        existing_frames = resume_info["existing_frames"]
+        num_existing = resume_info["num_existing"]
+
+        print(f"\n{'='*50}")
+        print("RESUME MODE DETECTED")
+        print(f"{'='*50}")
+        print(f"  - Found {num_existing} existing frames")
+        print(f"  - Last processed frame: {last_frame}")
+        print(f"  - Current frame stride: {frame_stride}")
+
+        # Determine resume strategy
+        # Check if we need to fill gaps (stride decreased) or continue from last frame
+        expected_frames_up_to_last = set(range(0, last_frame + 1, frame_stride))
+        missing_frames = expected_frames_up_to_last - existing_frames
+
+        if missing_frames:
+            print(f"  - Missing {len(missing_frames)} frames with current stride")
+            print(f"  - Will process missing frames first, then continue")
+            resume_from = 0  # Need to fill gaps
+        else:
+            print(f"  - No missing frames, continuing from frame {last_frame + frame_stride}")
+            resume_from = last_frame + frame_stride
     else:
-        text_prompts = list(text_prompt)
+        resume_from = 0
+        existing_frames = set()
 
     print(f"\nVideo Info:")
     print(f"  - Total frames: {total_frames}")
     print(f"  - FPS: {fps}")
     print(f"  - Resolution: {video_info['width']}x{video_info['height']}")
-    print(f"  - Text prompts: {text_prompts}")
+    print(f"  - Text prompt: '{text_prompt}'")
+    print(f"  - Frame stride: every {frame_stride} frame(s)")
+    if should_resume:
+        print(f"  - Resume from: frame {resume_from}")
 
     if chunk_size is None:
         chunk_size = total_frames
@@ -374,23 +455,20 @@ def process_video_in_chunks(
     )
     session_id = response["session_id"]
 
-    # Add text prompts for each object type
-    obj_ids_found = []
-    for prompt in text_prompts:
-        print(f"Adding text prompt '{prompt}' on frame {prompt_frame}...")
-        response = predictor.handle_request(
-            request=dict(
-                type="add_prompt",
-                session_id=session_id,
-                frame_index=prompt_frame,
-                text=prompt,
-            )
+    # Add text prompt
+    print(f"Adding text prompt '{text_prompt}' on frame {prompt_frame}...")
+    response = predictor.handle_request(
+        request=dict(
+            type="add_prompt",
+            session_id=session_id,
+            frame_index=prompt_frame,
+            text=text_prompt,
         )
+    )
 
-        initial_objects = response.get("outputs", {})
-        prompt_obj_ids = list(initial_objects.get("obj_ids", []))
-        obj_ids_found.extend(prompt_obj_ids)
-        print(f"  Found {len(prompt_obj_ids)} objects for '{prompt}'")
+    initial_objects = response.get("outputs", {})
+    obj_ids_found = list(initial_objects.get("obj_ids", []))
+    print(f"Found {len(obj_ids_found)} objects on prompt frame")
 
     # Process in chunks
     all_outputs = {}
@@ -435,6 +513,10 @@ def process_video_in_chunks(
 
             # Get the original frame index for saving (if using stride/limit)
             save_frame_idx = index_mapping.get(frame_idx, frame_idx) if index_mapping else frame_idx
+
+            # Skip if frame already exists (resume mode)
+            if should_resume and save_frame_idx in existing_frames:
+                continue
 
             # Track detections
             has_detections = (out_obj_ids is not None and len(out_obj_ids) > 0 and
@@ -485,7 +567,7 @@ def process_video_in_chunks(
     # Save metadata
     metadata = {
         "video_path": video_path,
-        "text_prompts": text_prompts,
+        "text_prompt": text_prompt,
         "total_frames": total_frames,
         "fps": fps,
         "resolution": [video_info["width"], video_info["height"]],
@@ -545,6 +627,27 @@ def create_output_video(output_dir: str, fps: float = 30.0):
     print(f"Video saved to {video_path}")
 
 
+def create_prompt_subdir(base_output_dir: str, text_prompt: str) -> str:
+    """
+    Create a subdirectory based on the text prompt to separate results.
+
+    Args:
+        base_output_dir: Base output directory
+        text_prompt: Text prompt string
+
+    Returns:
+        Full path to the prompt-specific subdirectory
+    """
+    # Create a clean folder name from prompt
+    prompt_name = text_prompt
+    # Remove special characters and limit length
+    prompt_name = "".join(c if c.isalnum() or c in "_-" else "_" for c in prompt_name)
+    prompt_name = prompt_name[:100]  # Limit length
+
+    prompt_dir = os.path.join(base_output_dir, prompt_name)
+    return prompt_dir
+
+
 def main():
     args = parse_args()
 
@@ -552,6 +655,13 @@ def main():
     if not os.path.exists(args.video_path):
         print(f"Error: Video path does not exist: {args.video_path}")
         sys.exit(1)
+
+    # Create prompt-specific subdirectory
+    output_dir = create_prompt_subdir(args.output_dir, args.text_prompt)
+    print(f"\nPrompt-specific output directory: {output_dir}")
+
+    # Check for existing results and resume capability
+    resume_info = detect_resume_point(output_dir, args.frame_stride)
 
     # Setup GPUs
     if args.gpus is not None:
@@ -598,7 +708,7 @@ def main():
         outputs, metadata = process_video_in_chunks(
             predictor=predictor,
             video_path=video_path_to_use,
-            output_dir=args.output_dir,
+            output_dir=output_dir,
             text_prompt=args.text_prompt,
             chunk_size=args.chunk_size,
             prompt_frame=args.prompt_frame,
@@ -606,6 +716,8 @@ def main():
             save_visualizations=args.save_visualizations,
             offload_to_cpu=args.offload_to_cpu,
             index_mapping=index_mapping,
+            frame_stride=args.frame_stride,
+            resume_info=resume_info,
         )
 
         # Update metadata with extraction info
@@ -616,19 +728,19 @@ def main():
             metadata["original_video_path"] = args.video_path
 
             # Re-save metadata
-            metadata_path = os.path.join(args.output_dir, "metadata.json")
+            metadata_path = os.path.join(output_dir, "metadata.json")
             with open(metadata_path, "w") as f:
                 json.dump(metadata, f, indent=2)
 
         # Create output video if requested
         output_fps = effective_fps if effective_fps else metadata["fps"]
         if args.save_video:
-            create_output_video(args.output_dir, fps=output_fps)
+            create_output_video(output_dir, fps=output_fps)
 
         print(f"\n{'='*50}")
         print("Processing complete!")
         print(f"{'='*50}")
-        print(f"Output directory: {args.output_dir}")
+        print(f"Output directory: {output_dir}")
         print(f"Frames processed: {metadata['frames_processed']}")
         if args.frame_stride > 1:
             print(f"Frame stride: {args.frame_stride} (every {args.frame_stride} frames)")
@@ -636,11 +748,11 @@ def main():
             print(f"Max frames limit: {args.max_frames}")
         print(f"Objects tracked: {len(metadata['objects_found'])}")
         if args.save_masks:
-            print(f"Masks saved to: {os.path.join(args.output_dir, 'masks')}")
+            print(f"Masks saved to: {os.path.join(output_dir, 'masks')}")
         if args.save_visualizations:
-            print(f"Visualizations saved to: {os.path.join(args.output_dir, 'visualizations')}")
+            print(f"Visualizations saved to: {os.path.join(output_dir, 'visualizations')}")
         if args.save_video:
-            print(f"Output video: {os.path.join(args.output_dir, 'output_video.mp4')}")
+            print(f"Output video: {os.path.join(output_dir, 'output_video.mp4')}")
 
     finally:
         # Clean up
