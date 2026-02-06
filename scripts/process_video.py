@@ -476,27 +476,33 @@ def process_video_in_chunks(
     frames_with_detections = 0
     all_obj_ids_seen = set()
 
-    # Calculate chunks
+    # Calculate chunks (starting from resume point if applicable)
     chunks = []
-    start = 0
+    start = resume_from if should_resume else 0
     while start < total_frames:
         end = min(start + chunk_size, total_frames)
         chunks.append((start, end))
         start = end
 
-    print(f"\nProcessing video in {len(chunks)} chunk(s)...")
+    if should_resume and resume_from > 0:
+        print(f"\nProcessing video in {len(chunks)} chunk(s) (starting from frame {resume_from})...")
+    else:
+        print(f"\nProcessing video in {len(chunks)} chunk(s)...")
 
     for chunk_idx, (chunk_start, chunk_end) in enumerate(chunks):
         chunk_frames = chunk_end - chunk_start
         print(f"\nChunk {chunk_idx + 1}/{len(chunks)}: frames {chunk_start} to {chunk_end - 1}")
 
         # Propagate for this chunk
+        # For first chunk, only use start_frame_index if resuming from a specific frame
+        use_start_frame = chunk_start if (chunk_idx > 0 or (should_resume and resume_from > 0)) else None
+
         for response in tqdm(
             predictor.handle_stream_request(
                 request=dict(
                     type="propagate_in_video",
                     session_id=session_id,
-                    start_frame_index=chunk_start if chunk_idx > 0 else None,
+                    start_frame_index=use_start_frame,
                     max_frame_num_to_track=chunk_frames,
                 )
             ),
