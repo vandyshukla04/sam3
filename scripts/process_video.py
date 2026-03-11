@@ -311,19 +311,31 @@ def save_mask(mask, obj_id, frame_idx, output_dir):
     cv2.imwrite(mask_path, mask_uint8)
 
 
-def detect_resume_point(output_dir: str, frame_stride: int):
+def detect_resume_point(output_dir: str, frame_stride: int, reverse_index_mapping: dict = None):
     """
     Detect the last processed frame and determine where to resume.
 
+    Args:
+        output_dir: Output directory to check for existing frames
+        frame_stride: Frame stride used during extraction
+        reverse_index_mapping: Optional dict mapping original frame indices to extracted indices
+                               (inverse of index_mapping from extract_frames_to_folder)
+
     Returns:
         dict with keys:
-            - last_frame: last frame index that was processed
-            - existing_frames: set of frame indices that exist
+            - last_frame_original: last frame index in original video numbering
+            - last_frame_extracted: last frame index in extracted frame numbering
+            - existing_frames: set of frame indices that exist (in original numbering)
             - should_resume: whether to resume or start fresh
     """
     vis_dir = os.path.join(output_dir, "visualizations")
     if not os.path.exists(vis_dir):
-        return {"last_frame": None, "existing_frames": set(), "should_resume": False}
+        return {
+            "last_frame_original": None,
+            "last_frame_extracted": None,
+            "existing_frames": set(),
+            "should_resume": False
+        }
 
     import glob
     import re
@@ -331,7 +343,12 @@ def detect_resume_point(output_dir: str, frame_stride: int):
     # Find all existing visualization frames
     frames = glob.glob(os.path.join(vis_dir, "frame_*.jpg"))
     if not frames:
-        return {"last_frame": None, "existing_frames": set(), "should_resume": False}
+        return {
+            "last_frame_original": None,
+            "last_frame_extracted": None,
+            "existing_frames": set(),
+            "should_resume": False
+        }
 
     # Extract frame numbers
     existing_frames = set()
@@ -341,12 +358,26 @@ def detect_resume_point(output_dir: str, frame_stride: int):
             existing_frames.add(int(match.group(1)))
 
     if not existing_frames:
-        return {"last_frame": None, "existing_frames": set(), "should_resume": False}
+        return {
+            "last_frame_original": None,
+            "last_frame_extracted": None,
+            "existing_frames": set(),
+            "should_resume": False
+        }
 
-    last_frame = max(existing_frames)
+    last_frame_original = max(existing_frames)
+
+    # Convert original frame index to extracted frame index
+    if reverse_index_mapping is not None:
+        # Use the reverse mapping if provided (most accurate)
+        last_frame_extracted = reverse_index_mapping.get(last_frame_original, last_frame_original // frame_stride)
+    else:
+        # Fall back to calculation based on stride
+        last_frame_extracted = last_frame_original // frame_stride
 
     return {
-        "last_frame": last_frame,
+        "last_frame_original": last_frame_original,
+        "last_frame_extracted": last_frame_extracted,
         "existing_frames": existing_frames,
         "should_resume": True,
         "num_existing": len(existing_frames)
@@ -385,7 +416,8 @@ def process_video_in_chunks(
     # Check for resume
     should_resume = resume_info and resume_info.get("should_resume", False)
     if should_resume:
-        last_frame = resume_info["last_frame"]
+        last_frame_original = resume_info["last_frame_original"]
+        last_frame_extracted = resume_info["last_frame_extracted"]
         existing_frames = resume_info["existing_frames"]
         num_existing = resume_info["num_existing"]
 
@@ -393,12 +425,12 @@ def process_video_in_chunks(
         print("RESUME MODE DETECTED")
         print(f"{'='*50}")
         print(f"  - Found {num_existing} existing frames")
-        print(f"  - Last processed frame: {last_frame}")
+        print(f"  - Last processed frame: {last_frame_original} (original), {last_frame_extracted} (extracted)")
         print(f"  - Current frame stride: {frame_stride}")
 
         # Determine resume strategy
         # Check if we need to fill gaps (stride decreased) or continue from last frame
-        expected_frames_up_to_last = set(range(0, last_frame + 1, frame_stride))
+        expected_frames_up_to_last = set(range(0, last_frame_original + 1, frame_stride))
         missing_frames = expected_frames_up_to_last - existing_frames
 
         if missing_frames:
@@ -406,8 +438,11 @@ def process_video_in_chunks(
             print(f"  - Will process missing frames first, then continue")
             resume_from = 0  # Need to fill gaps
         else:
-            print(f"  - No missing frames, continuing from frame {last_frame + frame_stride}")
-            resume_from = last_frame + frame_stride
+            # Continue from next extracted frame (not original frame!)
+            next_frame_extracted = last_frame_extracted + 1
+            next_frame_original = last_frame_original + frame_stride
+            print(f"  - No missing frames, continuing from frame {next_frame_extracted} (extracted) / {next_frame_original} (original)")
+            resume_from = next_frame_extracted
     else:
         resume_from = 0
         existing_frames = set()
@@ -419,7 +454,7 @@ def process_video_in_chunks(
     print(f"  - Text prompt: '{text_prompt}'")
     print(f"  - Frame stride: every {frame_stride} frame(s)")
     if should_resume:
-        print(f"  - Resume from: frame {resume_from}")
+        print(f"  - Resume from: frame {resume_from} (in extracted frame sequence)")
 
     if chunk_size is None:
         chunk_size = total_frames
@@ -702,6 +737,11 @@ def main():
         effective_fps = extraction_info["effective_fps"]
 
         print(f"  - Effective FPS: {effective_fps:.1f}")
+
+        # Update resume info with correct frame mapping (original -> extracted)
+        if resume_info.get("should_resume", False):
+            reverse_index_mapping = {v: k for k, v in index_mapping.items()}
+            resume_info = detect_resume_point(output_dir, args.frame_stride, reverse_index_mapping)
 
     # Build predictor
     print("\nBuilding SAM3 video predictor...")
