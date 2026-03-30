@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import py_compile; py_compile.compile\\(''scripts/extract_segments_frames.py'', doraise=True\\); print\\(''OK''\\)\")",
+      "Bash(grep -r \"sam3_mask_loader\\\\|load_sam3\" /home/shuklva/vggt/*.py)",
+      "Bash(python3:*)",
+      "Bash(python -c \"import py_compile; py_compile.compile\\(''scripts/generate_sam3_masks.py'', doraise=True\\); print\\(''Script 1 OK''\\)\")",
+      "Bash(python -c \"import py_compile; py_compile.compile\\(''scripts/process_segments_vggt.py'', doraise=True\\); print\\(''Script 2 OK''\\)\")",
+      "Bash(ls /home/shuklva/vggt/batch_inference*.py)",
+      "Bash(python -c \"import py_compile; py_compile.compile\\(''batch_inference_zip.py'', doraise=True\\); print\\(''OK''\\)\")"
+    ]
+  }
+}
