@@ -125,15 +125,14 @@ def save_progress(work_dir: str, progress: dict):
     os.replace(tmp_path, progress_path)
 
 
-def is_segment_masks_complete(seg_dir: str):
-    """Check if SAM3 masks already exist and look complete for a segment."""
-    masks_dir = os.path.join(seg_dir, "sam3_masks")
+def is_segment_masks_complete(seg_dir: str, text_prompt: str):
+    """Check if SAM3 masks already exist and look complete for a segment and prompt."""
+    masks_dir = os.path.join(seg_dir, "sam3_masks", text_prompt)
     if not os.path.isdir(masks_dir):
         return False
     meta_path = os.path.join(masks_dir, "metadata.json")
     if not os.path.isfile(meta_path):
         return False
-    # Check at least one obj directory with masks
     mask_root = os.path.join(masks_dir, "masks")
     if not os.path.isdir(mask_root):
         return False
@@ -223,8 +222,8 @@ def process_segment_sam3(predictor, seg_dir: str, metadata: dict,
 
         print(f"    Created {num_frames} sequential symlinks for SAM3")
 
-        # Output directory for masks
-        masks_output = os.path.join(seg_dir, "sam3_masks")
+        # Output directory for masks (class subdirectory for multi-class support)
+        masks_output = os.path.join(seg_dir, "sam3_masks", text_prompt)
         os.makedirs(os.path.join(masks_output, "masks"), exist_ok=True)
 
         # Start SAM3 session on the temp directory
@@ -401,14 +400,14 @@ def main():
             video_name = os.path.basename(video_dir)
             seg_id = f"{video_name}/{seg_name}"
 
-            # Check if already complete
-            if seg_id in completed and is_segment_masks_complete(seg_dir):
-                print(f"[{seg_id}] SKIP (already complete)")
+            # Check if already complete for this prompt
+            if seg_id in completed and is_segment_masks_complete(seg_dir, args.text_prompt):
+                print(f"[{seg_id}] SKIP (already complete for '{args.text_prompt}')")
                 total_skipped += 1
                 continue
 
-            # Clean up incomplete masks if present
-            masks_dir = os.path.join(seg_dir, "sam3_masks")
+            # Clean up incomplete masks for this prompt only (preserve other classes)
+            masks_dir = os.path.join(seg_dir, "sam3_masks", args.text_prompt)
             if os.path.isdir(masks_dir):
                 shutil.rmtree(masks_dir)
 
