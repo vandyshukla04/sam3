@@ -86,7 +86,7 @@ def parse_args():
         "--chunk_size",
         type=int,
         default=None,
-        help="Frames per processing chunk (default: all at once)",
+        help="DEPRECATED and ignored: all frames are always propagated in one call",
     )
     parser.add_argument(
         "--gpus",
@@ -252,91 +252,82 @@ def main():
         frames_with_detections = 0
         all_obj_ids_seen = set()
 
-        chunk_size = args.chunk_size if args.chunk_size else total_selected
+        if args.chunk_size:
+            print(f"\nNOTE: --chunk_size {args.chunk_size} is ignored; all frames are propagated in one call")
 
-        chunks = []
-        start = 0
-        while start < total_selected:
-            end = min(start + chunk_size, total_selected)
-            chunks.append((start, end))
-            start = end
+        # Single propagation over all selected frames ("both" = forward from the
+        # prompt frame, then backward to frame 0). Do NOT split this into several
+        # propagate calls with start_frame_index: SAM3's session action history
+        # turns every later call into a cache fetch that yields empty outputs.
+        print(f"\nPropagating through {total_selected} frames (prompt on frame {prompt_frame})...")
 
-        print(f"\nProcessing in {len(chunks)} chunk(s)...")
+        for response in tqdm(
+            predictor.handle_stream_request(
+                request=dict(
+                    type="propagate_in_video",
+                    session_id=session_id,
+                    propagation_direction="both",
+                )
+            ),
+            total=total_selected,
+            desc="Propagating",
+        ):
+            frame_idx = response["frame_index"]  # sequential index
+            outputs = response["outputs"]
+            all_outputs[frame_idx] = outputs
 
-        for chunk_idx, (chunk_start, chunk_end) in enumerate(chunks):
-            chunk_frames = chunk_end - chunk_start
-            print(f"\nChunk {chunk_idx + 1}/{len(chunks)}: sequential frames {chunk_start} to {chunk_end - 1}")
+            out_binary_masks = outputs.get("out_binary_masks", None)
+            out_obj_ids = outputs.get("out_obj_ids", None)
 
-            use_start_frame = chunk_start if chunk_idx > 0 else None
+            # Map back to original frame index for saving
+            save_frame_idx = index_mapping.get(frame_idx, frame_idx)
 
-            for response in tqdm(
-                predictor.handle_stream_request(
-                    request=dict(
-                        type="propagate_in_video",
-                        session_id=session_id,
-                        start_frame_index=use_start_frame,
-                        max_frame_num_to_track=chunk_frames,
-                    )
-                ),
-                total=chunk_frames,
-                desc=f"Processing chunk {chunk_idx + 1}",
-            ):
-                frame_idx = response["frame_index"]  # sequential index
-                outputs = response["outputs"]
-                all_outputs[frame_idx] = outputs
+            has_detections = (
+                out_obj_ids is not None
+                and len(out_obj_ids) > 0
+                and out_binary_masks is not None
+                and len(out_binary_masks) > 0
+            )
 
-                out_binary_masks = outputs.get("out_binary_masks", None)
-                out_obj_ids = outputs.get("out_obj_ids", None)
+            if has_detections:
+                frames_with_detections += 1
+                total_detections += len(out_obj_ids)
+                for oid in out_obj_ids:
+                    oid_val = int(oid.item()) if hasattr(oid, "item") else int(oid)
+                    all_obj_ids_seen.add(oid_val)
 
-                # Map back to original frame index for saving
-                save_frame_idx = index_mapping.get(frame_idx, frame_idx)
-
-                has_detections = (
-                    out_obj_ids is not None
-                    and len(out_obj_ids) > 0
-                    and out_binary_masks is not None
-                    and len(out_binary_masks) > 0
+            if has_detections:
+                masks = (
+                    out_binary_masks.cpu().numpy()
+                    if hasattr(out_binary_masks, "cpu")
+                    else out_binary_masks
                 )
 
-                if has_detections:
-                    frames_with_detections += 1
-                    total_detections += len(out_obj_ids)
-                    for oid in out_obj_ids:
-                        oid_val = int(oid.item()) if hasattr(oid, "item") else int(oid)
-                        all_obj_ids_seen.add(oid_val)
+                if args.save_masks:
+                    for obj_id, mask in zip(out_obj_ids, masks):
+                        save_mask(mask, obj_id, save_frame_idx, output_dir)
 
-                if has_detections:
-                    masks = (
-                        out_binary_masks.cpu().numpy()
-                        if hasattr(out_binary_masks, "cpu")
-                        else out_binary_masks
-                    )
-
-                    if args.save_masks:
-                        for obj_id, mask in zip(out_obj_ids, masks):
-                            save_mask(mask, obj_id, save_frame_idx, output_dir)
-
-                    if args.save_visualizations:
-                        frame_path = os.path.join(temp_dir, f"{frame_idx:06d}.jpg")
-                        frame = np.array(Image.open(frame_path))
-                        vis_frame = overlay_masks_on_frame(
-                            frame, masks, out_obj_ids, colors
-                        )
-                        vis_path = os.path.join(
-                            output_dir,
-                            "visualizations",
-                            f"frame_{save_frame_idx:06d}.jpg",
-                        )
-                        Image.fromarray(vis_frame).save(vis_path, quality=95)
-                elif args.save_visualizations:
+                if args.save_visualizations:
                     frame_path = os.path.join(temp_dir, f"{frame_idx:06d}.jpg")
                     frame = np.array(Image.open(frame_path))
+                    vis_frame = overlay_masks_on_frame(
+                        frame, masks, out_obj_ids, colors
+                    )
                     vis_path = os.path.join(
                         output_dir,
                         "visualizations",
                         f"frame_{save_frame_idx:06d}.jpg",
                     )
-                    Image.fromarray(frame).save(vis_path, quality=95)
+                    Image.fromarray(vis_frame).save(vis_path, quality=95)
+            elif args.save_visualizations:
+                frame_path = os.path.join(temp_dir, f"{frame_idx:06d}.jpg")
+                frame = np.array(Image.open(frame_path))
+                vis_path = os.path.join(
+                    output_dir,
+                    "visualizations",
+                    f"frame_{save_frame_idx:06d}.jpg",
+                )
+                Image.fromarray(frame).save(vis_path, quality=95)
 
         # Close session
         predictor.handle_request(

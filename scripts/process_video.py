@@ -4,11 +4,11 @@
 """
 SAM3 Video Processing Script
 
-Process videos (including long ones in chunks) with SAM3 and save segmentation results.
+Process videos with SAM3 and save segmentation results.
 
 Features:
 - Automatic resume capability: If processing crashes or runs out of memory, re-running
-  the same command will continue from where it left off
+  the same command skips re-saving frames that already exist on disk
 - Prompt-specific subdirectories: Different prompts save to separate folders to avoid conflicts
 - Frame stride support: Process every Nth frame to reduce processing time
 
@@ -16,10 +16,14 @@ Usage:
     python scripts/process_video.py \
         --video_path /path/to/video.mp4 \
         --output_dir /path/to/output \
-        --text_prompt "person" \
-        --chunk_size 500
+        --text_prompt "person"
 
-For long videos, the script processes in chunks to manage memory efficiently.
+Propagation always runs as ONE propagate_in_video call over the whole video.
+Splitting it into several calls with start_frame_index does not work: SAM3's
+session keeps an action history, and every propagate call after the first is
+interpreted as "fetch cached results", so no inference runs and frames beyond the
+first call come back empty. --chunk_size is kept for backwards compatibility but
+is ignored. Use --frame_stride / --max_frames to limit GPU memory on long videos.
 
 Examples:
     # Process first 400 frames only
@@ -81,8 +85,9 @@ def parse_args():
         "--chunk_size",
         type=int,
         default=None,
-        help="Number of frames to process per chunk. If None, processes entire video at once. "
-        "Use smaller values (e.g., 200-500) for long videos to manage memory.",
+        help="DEPRECATED and ignored: the whole video is always propagated in one call "
+        "(multiple propagate calls on one session return empty results). "
+        "Use --frame_stride / --max_frames to limit memory on long videos.",
     )
     parser.add_argument(
         "--prompt_frame",
@@ -399,10 +404,10 @@ def process_video_in_chunks(
     resume_info: dict = None,
 ):
     """
-    Process video in chunks and save results.
+    Run SAM3 over the whole video in a single propagation and save results.
 
-    For long videos, this processes the video in manageable chunks to avoid
-    running out of GPU memory.
+    `chunk_size` is accepted for backwards compatibility and ignored (see the
+    module docstring for why chunked propagation cannot work).
 
     Args:
         index_mapping: Optional dict mapping extracted frame indices to original frame indices.
@@ -428,23 +433,11 @@ def process_video_in_chunks(
         print(f"  - Last processed frame: {last_frame_original} (original), {last_frame_extracted} (extracted)")
         print(f"  - Current frame stride: {frame_stride}")
 
-        # Determine resume strategy
-        # Check if we need to fill gaps (stride decreased) or continue from last frame
-        expected_frames_up_to_last = set(range(0, last_frame_original + 1, frame_stride))
-        missing_frames = expected_frames_up_to_last - existing_frames
-
-        if missing_frames:
-            print(f"  - Missing {len(missing_frames)} frames with current stride")
-            print(f"  - Will process missing frames first, then continue")
-            resume_from = 0  # Need to fill gaps
-        else:
-            # Continue from next extracted frame (not original frame!)
-            next_frame_extracted = last_frame_extracted + 1
-            next_frame_original = last_frame_original + frame_stride
-            print(f"  - No missing frames, continuing from frame {next_frame_extracted} (extracted) / {next_frame_original} (original)")
-            resume_from = next_frame_extracted
+        # Propagation cannot be restarted mid-video (see module docstring), so we
+        # always propagate from the prompt frame again and only skip re-saving
+        # the frames that already exist on disk.
+        print(f"  - Propagation re-runs over the full video; {num_existing} existing frames will not be re-saved")
     else:
-        resume_from = 0
         existing_frames = set()
 
     print(f"\nVideo Info:")
@@ -453,16 +446,9 @@ def process_video_in_chunks(
     print(f"  - Resolution: {video_info['width']}x{video_info['height']}")
     print(f"  - Text prompt: '{text_prompt}'")
     print(f"  - Frame stride: every {frame_stride} frame(s)")
-    if should_resume:
-        print(f"  - Resume from: frame {resume_from} (in extracted frame sequence)")
 
-    if chunk_size is None:
-        chunk_size = total_frames
-        print(f"  - Processing: entire video at once")
-    else:
-        num_chunks = (total_frames + chunk_size - 1) // chunk_size
-        print(f"  - Chunk size: {chunk_size} frames")
-        print(f"  - Number of chunks: {num_chunks}")
+    if chunk_size is not None:
+        print(f"  - NOTE: --chunk_size {chunk_size} is ignored; the whole video is propagated in one call")
 
     # Create output directories
     os.makedirs(output_dir, exist_ok=True)
@@ -505,93 +491,77 @@ def process_video_in_chunks(
     obj_ids_found = list(initial_objects.get("obj_ids", []))
     print(f"Found {len(obj_ids_found)} objects on prompt frame")
 
-    # Process in chunks
     all_outputs = {}
     total_detections = 0
     frames_with_detections = 0
     all_obj_ids_seen = set()
 
-    # Calculate chunks (starting from resume point if applicable)
-    chunks = []
-    start = resume_from if should_resume else 0
-    while start < total_frames:
-        end = min(start + chunk_size, total_frames)
-        chunks.append((start, end))
-        start = end
+    # Single propagation over the whole video. "both" propagates forward from the
+    # prompt frame to the end, then backward from the prompt frame to frame 0, so
+    # every frame is covered whatever --prompt_frame is. Never split this into
+    # several calls with start_frame_index: the session's action history makes any
+    # later call a cache fetch that returns empty outputs for unprocessed frames.
+    print(f"\nPropagating through {total_frames} frames (prompt on frame {prompt_frame})...")
 
-    if should_resume and resume_from > 0:
-        print(f"\nProcessing video in {len(chunks)} chunk(s) (starting from frame {resume_from})...")
-    else:
-        print(f"\nProcessing video in {len(chunks)} chunk(s)...")
+    for response in tqdm(
+        predictor.handle_stream_request(
+            request=dict(
+                type="propagate_in_video",
+                session_id=session_id,
+                propagation_direction="both",
+            )
+        ),
+        total=total_frames,
+        desc="Propagating",
+    ):
+        frame_idx = response["frame_index"]
+        outputs = response["outputs"]
+        all_outputs[frame_idx] = outputs
 
-    for chunk_idx, (chunk_start, chunk_end) in enumerate(chunks):
-        chunk_frames = chunk_end - chunk_start
-        print(f"\nChunk {chunk_idx + 1}/{len(chunks)}: frames {chunk_start} to {chunk_end - 1}")
+        # Get masks and object IDs (correct keys from SAM3 output)
+        out_binary_masks = outputs.get("out_binary_masks", None)
+        out_obj_ids = outputs.get("out_obj_ids", None)
 
-        # Propagate for this chunk
-        # For first chunk, only use start_frame_index if resuming from a specific frame
-        use_start_frame = chunk_start if (chunk_idx > 0 or (should_resume and resume_from > 0)) else None
+        # Get the original frame index for saving (if using stride/limit)
+        save_frame_idx = index_mapping.get(frame_idx, frame_idx) if index_mapping else frame_idx
 
-        for response in tqdm(
-            predictor.handle_stream_request(
-                request=dict(
-                    type="propagate_in_video",
-                    session_id=session_id,
-                    start_frame_index=use_start_frame,
-                    max_frame_num_to_track=chunk_frames,
-                )
-            ),
-            total=chunk_frames,
-            desc=f"Processing chunk {chunk_idx + 1}",
-        ):
-            frame_idx = response["frame_index"]
-            outputs = response["outputs"]
-            all_outputs[frame_idx] = outputs
+        # Skip if frame already exists (resume mode)
+        if should_resume and save_frame_idx in existing_frames:
+            continue
 
-            # Get masks and object IDs (correct keys from SAM3 output)
-            out_binary_masks = outputs.get("out_binary_masks", None)
-            out_obj_ids = outputs.get("out_obj_ids", None)
+        # Track detections
+        has_detections = (out_obj_ids is not None and len(out_obj_ids) > 0 and
+                          out_binary_masks is not None and len(out_binary_masks) > 0)
 
-            # Get the original frame index for saving (if using stride/limit)
-            save_frame_idx = index_mapping.get(frame_idx, frame_idx) if index_mapping else frame_idx
+        if has_detections:
+            frames_with_detections += 1
+            total_detections += len(out_obj_ids)
+            for oid in out_obj_ids:
+                oid_val = int(oid.item()) if hasattr(oid, 'item') else int(oid)
+                all_obj_ids_seen.add(oid_val)
 
-            # Skip if frame already exists (resume mode)
-            if should_resume and save_frame_idx in existing_frames:
-                continue
+        if has_detections:
+            # Masks are already binary from SAM3
+            masks = out_binary_masks.cpu().numpy() if hasattr(out_binary_masks, 'cpu') else out_binary_masks
 
-            # Track detections
-            has_detections = (out_obj_ids is not None and len(out_obj_ids) > 0 and
-                              out_binary_masks is not None and len(out_binary_masks) > 0)
+            # Save individual masks
+            if save_masks:
+                for obj_id, mask in zip(out_obj_ids, masks):
+                    save_mask(mask, obj_id, save_frame_idx, output_dir)
 
-            if has_detections:
-                frames_with_detections += 1
-                total_detections += len(out_obj_ids)
-                for oid in out_obj_ids:
-                    oid_val = int(oid.item()) if hasattr(oid, 'item') else int(oid)
-                    all_obj_ids_seen.add(oid_val)
-
-            if has_detections:
-                # Masks are already binary from SAM3
-                masks = out_binary_masks.cpu().numpy() if hasattr(out_binary_masks, 'cpu') else out_binary_masks
-
-                # Save individual masks
-                if save_masks:
-                    for obj_id, mask in zip(out_obj_ids, masks):
-                        save_mask(mask, obj_id, save_frame_idx, output_dir)
-
-                # Save visualization with masks
-                if save_visualizations:
-                    frame = video_frames[frame_idx]
-                    vis_frame = overlay_masks_on_frame(frame, masks, out_obj_ids, colors)
-                    vis_path = os.path.join(output_dir, "visualizations", f"frame_{save_frame_idx:06d}.jpg")
-                    Image.fromarray(vis_frame).save(vis_path, quality=95)
-            elif save_visualizations:
-                # Save frame without masks (no objects detected)
+            # Save visualization with masks
+            if save_visualizations:
                 frame = video_frames[frame_idx]
-                if isinstance(frame, str):
-                    frame = np.array(Image.open(frame))
+                vis_frame = overlay_masks_on_frame(frame, masks, out_obj_ids, colors)
                 vis_path = os.path.join(output_dir, "visualizations", f"frame_{save_frame_idx:06d}.jpg")
-                Image.fromarray(frame).save(vis_path, quality=95)
+                Image.fromarray(vis_frame).save(vis_path, quality=95)
+        elif save_visualizations:
+            # Save frame without masks (no objects detected)
+            frame = video_frames[frame_idx]
+            if isinstance(frame, str):
+                frame = np.array(Image.open(frame))
+            vis_path = os.path.join(output_dir, "visualizations", f"frame_{save_frame_idx:06d}.jpg")
+            Image.fromarray(frame).save(vis_path, quality=95)
 
     # Print detection summary
     print(f"\n{'='*50}")
@@ -612,7 +582,7 @@ def process_video_in_chunks(
         "total_frames": total_frames,
         "fps": fps,
         "resolution": [video_info["width"], video_info["height"]],
-        "chunk_size": chunk_size if chunk_size != total_frames else None,
+        "chunk_size": None,  # chunking removed: always a single propagation
         "objects_found": obj_ids_found,
         "frames_processed": len(all_outputs),
         "frames_with_detections": frames_with_detections,

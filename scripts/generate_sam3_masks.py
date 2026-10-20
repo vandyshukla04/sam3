@@ -61,7 +61,7 @@ def parse_args():
     parser.add_argument("--text-prompt", type=str, required=True,
                         help="SAM3 text prompt (e.g., 'zebra', 'animal')")
     parser.add_argument("--chunk-size", type=int, default=500,
-                        help="SAM3 chunk size for processing (default: 500)")
+                        help="DEPRECATED and ignored: each segment is always propagated in one call")
     parser.add_argument("--prompt-frame", type=int, default=0,
                         help="Frame index (in extracted sequence) to add prompt on (default: 0)")
     parser.add_argument("--save-visualizations", action="store_true", default=False,
@@ -249,53 +249,45 @@ def process_segment_sam3(predictor, seg_dir: str, metadata: dict,
         obj_ids_found = list(response.get("outputs", {}).get("obj_ids", []))
         print(f"    Found {len(obj_ids_found)} objects on prompt frame")
 
-        # Process in chunks
         frames_with_detections = 0
         all_obj_ids_seen = set()
 
-        chunks = []
-        start = 0
-        while start < num_frames:
-            end = min(start + chunk_size, num_frames)
-            chunks.append((start, end))
-            start = end
-
-        for chunk_idx, (chunk_start, chunk_end) in enumerate(chunks):
-            chunk_frames = chunk_end - chunk_start
-            use_start_frame = chunk_start if chunk_idx > 0 else None
-
-            for response in tqdm(
-                predictor.handle_stream_request(
-                    request=dict(
-                        type="propagate_in_video",
-                        session_id=session_id,
-                        start_frame_index=use_start_frame,
-                        max_frame_num_to_track=chunk_frames,
-                    )
-                ),
-                total=chunk_frames,
-                desc=f"    Chunk {chunk_idx + 1}/{len(chunks)}",
-            ):
-                frame_idx = response["frame_index"]
-                outputs = response["outputs"]
-
-                out_binary_masks = outputs.get("out_binary_masks", None)
-                out_obj_ids = outputs.get("out_obj_ids", None)
-
-                has_detections = (
-                    out_obj_ids is not None and len(out_obj_ids) > 0
-                    and out_binary_masks is not None and len(out_binary_masks) > 0
+        # Single propagation over the whole segment ("both" = forward from the
+        # prompt frame, then backward to frame 0). Never split this into several
+        # propagate calls with start_frame_index: SAM3's session action history
+        # turns every later call into a cache fetch that yields empty outputs,
+        # which is why segments longer than chunk_size used to lose their tail.
+        for response in tqdm(
+            predictor.handle_stream_request(
+                request=dict(
+                    type="propagate_in_video",
+                    session_id=session_id,
+                    propagation_direction="both",
                 )
+            ),
+            total=num_frames,
+            desc="    Propagating",
+        ):
+            frame_idx = response["frame_index"]
+            outputs = response["outputs"]
 
-                if has_detections:
-                    frames_with_detections += 1
-                    masks = out_binary_masks.cpu().numpy() if hasattr(out_binary_masks, "cpu") else out_binary_masks
+            out_binary_masks = outputs.get("out_binary_masks", None)
+            out_obj_ids = outputs.get("out_obj_ids", None)
 
-                    for obj_id, mask in zip(out_obj_ids, masks):
-                        oid_val = int(obj_id.item()) if hasattr(obj_id, "item") else int(obj_id)
-                        all_obj_ids_seen.add(oid_val)
-                        # Save with sequential index — will rename later
-                        save_mask(mask, obj_id, frame_idx, masks_output)
+            has_detections = (
+                out_obj_ids is not None and len(out_obj_ids) > 0
+                and out_binary_masks is not None and len(out_binary_masks) > 0
+            )
+
+            if has_detections:
+                frames_with_detections += 1
+                masks = out_binary_masks.cpu().numpy() if hasattr(out_binary_masks, "cpu") else out_binary_masks
+
+                for obj_id, mask in zip(out_obj_ids, masks):
+                    oid_val = int(obj_id.item()) if hasattr(obj_id, "item") else int(obj_id)
+                    all_obj_ids_seen.add(oid_val)
+                    # Save with sequential index — will rename later
+                    save_mask(mask, obj_id, frame_idx, masks_output)
 
         # Close session
         predictor.handle_request(
