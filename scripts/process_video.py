@@ -488,7 +488,7 @@ def process_video_in_chunks(
     )
 
     initial_objects = response.get("outputs", {})
-    obj_ids_found = list(initial_objects.get("obj_ids", []))
+    obj_ids_found = [int(x) for x in initial_objects.get("out_obj_ids", initial_objects.get("obj_ids", []))]
     print(f"Found {len(obj_ids_found)} objects on prompt frame")
 
     all_outputs = {}

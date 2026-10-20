@@ -246,7 +246,7 @@ def process_segment_sam3(predictor, seg_dir: str, metadata: dict,
                 text=text_prompt,
             )
         )
-        obj_ids_found = list(response.get("outputs", {}).get("obj_ids", []))
+        obj_ids_found = [int(x) for x in response.get("outputs", {}).get("out_obj_ids", [])]
         print(f"    Found {len(obj_ids_found)} objects on prompt frame")
 
         frames_with_detections = 0
