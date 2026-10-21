@@ -34,7 +34,11 @@ def parse_args():
     p.add_argument("--video_path", required=True)
     p.add_argument("--output_dir", required=True)
     p.add_argument("--text_prompt", default="animal", help="SAM3 prompt for step 1 (default: animal)")
-    p.add_argument("--species", required=True, help='closed label list, e.g. "roe deer,honey badger,red fox"')
+    p.add_argument("--species", default=None, help='closed label list, e.g. "roe deer,honey badger,red fox"')
+    p.add_argument("--species_file", default=None,
+                   help="species list file, e.g. scripts/species_lists/alps.txt (use this or --species)")
+    p.add_argument("--label_style", choices=ctb.LABEL_STYLES, default="scientific",
+                   help="text given to BioCLIP for --species_file entries (default: scientific name)")
     p.add_argument("--model", default=ctb.DEFAULT_MODEL, help="BioCLIP model string")
     p.add_argument("--max_crops_per_track", type=int, default=24)
     p.add_argument("--min_prob", type=float, default=0.5)
@@ -79,7 +83,7 @@ def main():
         sys.exit(f"no masks in {sam3_dir}; SAM3 found nothing to track (try another --text_prompt or --prompt_frame)")
 
     print("\n" + "=" * 60 + "\nSTEP 2: BioCLIP species per track\n" + "=" * 60)
-    ctb.run(sam3_dir, args.video_path, args.species.split(","), model=args.model,
+    ctb.run(sam3_dir, args.video_path, ctb.species_from_args(args), model=args.model,
             max_crops_per_track=args.max_crops_per_track, min_prob=args.min_prob, batch_size=args.batch_size,
             save_video=args.save_video)
 

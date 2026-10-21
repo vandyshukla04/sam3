@@ -1,0 +1,46 @@
+# Closed species list for the alpine camera-trap sites.
+# Format: scientific name | English name | Italian name   (one species per line)
+# "# group: ..." lines label the following species; used for the per-track group probability.
+# Amphibians and fishes are left out on purpose (not camera-trap targets).
+
+# group: mammals
+Ursus arctos | Brown bear | Orso bruno
+Canis lupus | Grey wolf | Lupo
+Vulpes vulpes | Red fox | Volpe
+Meles meles | European badger | Tasso
+Martes foina | Beech marten | Faina
+Martes martes | European pine marten | Martora
+Mustela erminea | Stoat | Ermellino
+Mustela nivalis | Least weasel | Donnola
+Rupicapra rupicapra | Chamois | Camoscio
+Capra ibex | Alpine ibex | Stambecco
+Cervus elaphus | Red deer | Cervo
+Capreolus capreolus | European roe deer | Capriolo
+Ovis aries musimon | European mouflon | Muflone
+Sciurus vulgaris | Red squirrel | Scoiattolo
+Marmota marmota | Alpine marmot | Marmotta
+Lepus europaeus | European hare | Lepre comune
+Lepus timidus | Mountain hare | Lepre alpina
+
+# group: birds
+Lagopus muta | Rock ptarmigan | Pernice bianca
+Alectoris graeca | Rock partridge | Coturnice
+Lyrurus tetrix | Black grouse | Gallo forcello
+Tetrao urogallus | Western capercaillie | Gallo cedrone
+Tetrastes bonasia | Hazel grouse | Francolino di monte
+Aquila chrysaetos | Golden eagle | Aquila reale
+Buteo buteo | Common buzzard | Poiana
+Accipiter gentilis | Northern goshawk | Astore
+Accipiter nisus | Eurasian sparrowhawk | Sparviere
+Pernis apivorus | European honey buzzard | Falco pecchiaiolo
+Falco tinnunculus | Common kestrel | Gheppio
+Gypaetus barbatus | Bearded vulture | Gipeto
+Strix aluco | Tawny owl | Allocco
+Asio otus | Long-eared owl | Gufo comune
+Aegolius funereus | Boreal owl | Civetta capogrosso
+Glaucidium passerinum | Eurasian pygmy owl | Civetta nana
+
+# group: reptiles
+Zootoca vivipara | Common lizard | Lucertola vivipara
+Vipera aspis | Asp viper | Aspide
+Vipera berus | Common European adder | Marasso

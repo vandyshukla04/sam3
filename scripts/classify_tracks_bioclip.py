@@ -39,6 +39,53 @@ import numpy as np
 
 DEFAULT_MODEL = "hf-hub:imageomics/bioclip-2.5-vith14"
 BIOCLIP2_MODEL = "hf-hub:imageomics/bioclip-2"
+LABEL_STYLES = ("scientific", "common", "both")
+
+
+# ---------------------------------------------------------------------------
+# species lists
+# ---------------------------------------------------------------------------
+
+def make_entry(label, name, scientific=None, common=None, group=None):
+    """label = text given to BioCLIP; name = what we print/draw; group = optional coarse class."""
+    return dict(label=label, name=name, scientific=scientific, common=common, group=group)
+
+
+def parse_species_arg(text):
+    """'roe deer,honey badger' -> entries whose label and name are the same string."""
+    return [make_entry(s.strip(), s.strip(), common=s.strip()) for s in text.split(",") if s.strip()]
+
+
+def load_species_file(path, label_style="scientific"):
+    """Read a species list file: 'Scientific | English | Local' per line, '# group: X' section lines.
+    label_style picks the text sent to BioCLIP: the scientific name (default, best zero-shot
+    accuracy for BioCLIP), the common name, or 'Scientific (Common)'."""
+    if label_style not in LABEL_STYLES:
+        raise ValueError(f"label_style must be one of {LABEL_STYLES}")
+    entries, group = [], None
+    for raw in open(path, encoding="utf-8"):
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("#"):
+            m = re.match(r"#\s*group\s*:\s*(.+)", line, re.I)
+            if m:
+                group = m.group(1).strip()
+            continue
+        parts = [p.strip() for p in line.split("|")]
+        scientific = parts[0]
+        common = parts[1] if len(parts) > 1 and parts[1] else scientific
+        label = {"scientific": scientific, "common": common, "both": f"{scientific} ({common})"}[label_style]
+        entries.append(make_entry(label, common, scientific=scientific, common=common, group=group))
+    if not entries:
+        raise ValueError(f"no species found in {path}")
+    return entries
+
+
+def to_entries(species):
+    if species and isinstance(species[0], dict):
+        return species
+    return [make_entry(s.strip(), s.strip(), common=s.strip()) for s in species if str(s).strip()]
 
 
 def parse_args():
@@ -47,7 +94,12 @@ def parse_args():
                    help="prompt sub-folder written by process_video.py (contains masks/ and metadata.json)")
     p.add_argument("--video_path", default=None,
                    help="original video or frame folder; default: taken from metadata.json")
-    p.add_argument("--species", required=True, help='comma-separated label list, e.g. "roe deer,honey badger,red fox"')
+    p.add_argument("--species", default=None, help='comma-separated label list, e.g. "roe deer,honey badger,red fox"')
+    p.add_argument("--species_file", default=None,
+                   help="species list file ('Scientific | English | Local' per line, '# group: X' sections), "
+                        "e.g. scripts/species_lists/alps.txt; use this or --species")
+    p.add_argument("--label_style", choices=LABEL_STYLES, default="scientific",
+                   help="text given to BioCLIP for --species_file entries (default: scientific name)")
     p.add_argument("--model", default=DEFAULT_MODEL, help=f"open_clip model string (default {DEFAULT_MODEL}; "
                                                           f"use {BIOCLIP2_MODEL} for the smaller BioCLIP 2)")
     p.add_argument("--max_crops_per_track", type=int, default=24)
@@ -174,13 +226,13 @@ def load_classifier(species, model, device):
         torch.compile = real_compile
 
 
-def classify_crops(classifier, species, crops_bgr, batch_size):
-    """Return (n_crops, n_species) probability matrix in the order of `species`."""
+def classify_crops(classifier, labels, crops_bgr, batch_size):
+    """Return (n_crops, n_labels) probability matrix in the order of `labels`."""
     from PIL import Image
     images = [Image.fromarray(cv2.cvtColor(c, cv2.COLOR_BGR2RGB)) for c in crops_bgr]
-    preds = classifier.predict(images, batch_size=batch_size)  # flat list: n_crops * n_species dicts
-    probs = np.zeros((len(images), len(species)), np.float32)
-    col = {s: i for i, s in enumerate(species)}
+    preds = classifier.predict(images, batch_size=batch_size)  # flat list: n_crops * n_labels dicts
+    probs = np.zeros((len(images), len(labels)), np.float32)
+    col = {s: i for i, s in enumerate(labels)}
     per_image = defaultdict(dict)
     for p in preds:
         per_image[p["file_name"]][p["classification"]] = p["score"]
@@ -190,16 +242,24 @@ def classify_crops(classifier, species, crops_bgr, batch_size):
     return probs
 
 
-def summarise(species, probs, min_prob):
+def summarise(entries, probs, min_prob):
+    names = [e["name"] for e in entries]
     mean = probs.mean(0)
-    votes = np.bincount(probs.argmax(1), minlength=len(species))
+    votes = np.bincount(probs.argmax(1), minlength=len(entries))
     best = int(mean.argmax())
+    group_prob = defaultdict(float)
+    for e, v in zip(entries, mean):
+        if e["group"]:
+            group_prob[e["group"]] += float(v)
     return dict(
-        species=species[best] if mean[best] >= min_prob else "uncertain",
-        best_label=species[best],
+        species=names[best] if mean[best] >= min_prob else "uncertain",
+        best_label=names[best],
+        scientific=entries[best]["scientific"],
+        group=entries[best]["group"],
         confidence=float(mean[best]),
-        mean_prob={s: float(v) for s, v in zip(species, mean)},
-        votes={s: int(v) for s, v in zip(species, votes)},
+        mean_prob={n: float(v) for n, v in zip(names, mean)},
+        group_prob=dict(group_prob),
+        votes={n: int(v) for n, v in zip(names, votes)},
         n_crops=int(len(probs)),
     )
 
@@ -266,7 +326,9 @@ def write_labelled_video(sam3_output_dir, results, fps, out_name="output_video.m
 def run(sam3_output_dir, video_path, species, model=DEFAULT_MODEL, max_crops_per_track=24, margin=0.15,
         min_box=32, min_prob=0.5, batch_size=8, device="cuda", save_crops=False, classifier=None,
         save_video=False):
-    species = [s.strip() for s in species if s.strip()]
+    entries = to_entries(species)
+    labels = [e["label"] for e in entries]
+    names = [e["name"] for e in entries]
     meta_path = os.path.join(sam3_output_dir, "metadata.json")
     meta = json.load(open(meta_path)) if os.path.isfile(meta_path) else {}
     if video_path is None:
@@ -279,7 +341,9 @@ def run(sam3_output_dir, video_path, species, model=DEFAULT_MODEL, max_crops_per
     print(f"  {len(tracks)} track(s), crops per track: " + ", ".join(f"obj_{o}={len(c)}" for o, c in sorted(crops.items())))
 
     if classifier is None:
-        classifier = load_classifier(species, model, device)
+        classifier = load_classifier(labels, model, device)
+    print(f"  closed list: {len(labels)} labels" + (f" in groups {sorted({e['group'] for e in entries if e['group']})}"
+                                                   if any(e["group"] for e in entries) else ""))
 
     results = {}
     for obj in sorted(tracks):
@@ -288,33 +352,38 @@ def run(sam3_output_dir, video_path, species, model=DEFAULT_MODEL, max_crops_per
                                 votes={}, n_crops=0, frames=sorted(tracks[obj]))
             print(f"  obj_{obj}: no usable crops (boxes smaller than --min_box {min_box} px or frames not found)")
             continue
-        probs = classify_crops(classifier, species, [c for _, c in crops[obj]], batch_size)
-        r = summarise(species, probs, min_prob)
+        probs = classify_crops(classifier, labels, [c for _, c in crops[obj]], batch_size)
+        r = summarise(entries, probs, min_prob)
         r["frames"] = [fn for fn, _ in crops[obj]]
-        r["per_crop_best"] = [species[i] for i in probs.argmax(1)]
+        r["per_crop_best"] = [names[i] for i in probs.argmax(1)]
         results[obj] = r
-        title = f"obj_{obj}: {r['species']}  (mean p={r['confidence']:.2f}, votes {r['votes']})"
-        contact_sheet(crops[obj], [f"{species[i][:10]} {p[i]:.2f}" for i, p in zip(probs.argmax(1), probs)],
+        top = sorted(r["mean_prob"].items(), key=lambda kv: -kv[1])[:3]
+        title = f"obj_{obj}: {r['species']}  (mean p={r['confidence']:.2f}; " + \
+                ", ".join(f"{n} {v:.2f}" for n, v in top) + ")"
+        contact_sheet(crops[obj], [f"{names[i][:12]} {p[i]:.2f}" for i, p in zip(probs.argmax(1), probs)],
                       title, os.path.join(sam3_output_dir, f"species_obj_{obj}.jpg"))
         if save_crops:
             d = os.path.join(sam3_output_dir, "species_crops", f"obj_{obj}")
             os.makedirs(d, exist_ok=True)
             for fn, c in crops[obj]:
                 cv2.imwrite(os.path.join(d, f"frame_{fn:06d}.jpg"), c, [cv2.IMWRITE_JPEG_QUALITY, 92])
-        print(f"  obj_{obj}: {r['species']:<14} mean p {r['confidence']:.2f}  "
-              + "  ".join(f"{s}={r['mean_prob'][s]:.2f}" for s in species) + f"  ({r['n_crops']} crops)")
+        print(f"  obj_{obj}: {r['species']:<22} mean p {r['confidence']:.2f}  top: "
+              + ", ".join(f"{n}={v:.2f}" for n, v in top)
+              + (f"  group: {max(r['group_prob'], key=r['group_prob'].get)} "
+                 f"{max(r['group_prob'].values()):.2f}" if r["group_prob"] else "") + f"  ({r['n_crops']} crops)")
 
-    out = dict(model=model, species_list=species, min_prob=min_prob, max_crops_per_track=max_crops_per_track,
+    out = dict(model=model, species_list=entries, min_prob=min_prob, max_crops_per_track=max_crops_per_track,
                video_path=video_path, tracks={f"obj_{o}": r for o, r in results.items()})
     with open(os.path.join(sam3_output_dir, "species_per_track.json"), "w") as f:
         json.dump(out, f, indent=2)
     with open(os.path.join(sam3_output_dir, "species_per_track.csv"), "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["track", "species", "confidence", "n_crops"] + [f"p({s})" for s in species])
+        w.writerow(["track", "species", "scientific", "group", "confidence", "n_crops"] + [f"p({n})" for n in names])
         for o, r in results.items():
-            w.writerow([f"obj_{o}", r["species"], f"{r['confidence']:.3f}", r["n_crops"]]
-                       + [f"{r['mean_prob'].get(s, 0):.3f}" for s in species])
-    meta["species"] = {f"obj_{o}": dict(species=r["species"], confidence=r["confidence"], n_crops=r["n_crops"])
+            w.writerow([f"obj_{o}", r["species"], r.get("scientific") or "", r.get("group") or "",
+                        f"{r['confidence']:.3f}", r["n_crops"]] + [f"{r['mean_prob'].get(n, 0):.3f}" for n in names])
+    meta["species"] = {f"obj_{o}": dict(species=r["species"], scientific=r.get("scientific"), group=r.get("group"),
+                                        confidence=r["confidence"], n_crops=r["n_crops"])
                        for o, r in results.items()}
     meta["species_model"] = model
     with open(meta_path, "w") as f:
@@ -326,9 +395,15 @@ def run(sam3_output_dir, video_path, species, model=DEFAULT_MODEL, max_crops_per
     return out
 
 
+def species_from_args(args):
+    if bool(args.species) == bool(args.species_file):
+        sys.exit("give exactly one of --species or --species_file")
+    return load_species_file(args.species_file, args.label_style) if args.species_file else parse_species_arg(args.species)
+
+
 def main():
     args = parse_args()
-    run(args.sam3_output_dir, args.video_path, args.species.split(","), model=args.model,
+    run(args.sam3_output_dir, args.video_path, species_from_args(args), model=args.model,
         max_crops_per_track=args.max_crops_per_track, margin=args.margin, min_box=args.min_box,
         min_prob=args.min_prob, batch_size=args.batch_size, device=args.device, save_crops=args.save_crops,
         save_video=args.save_video)
