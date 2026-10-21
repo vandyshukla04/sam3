@@ -47,7 +47,8 @@ def parse_args():
     p.add_argument("--chunk_size", type=int, default=None, help="ignored (kept for old commands)")
     p.add_argument("--gpus", type=str, default=None)
     p.add_argument("--offload_to_cpu", action="store_true", default=False)
-    p.add_argument("--save_video", action="store_true", default=False)
+    p.add_argument("--save_video", action="store_true", default=False,
+                   help="write output_video.mp4 after step 2, with the species label drawn on each track")
     return p.parse_args()
 
 
@@ -65,8 +66,7 @@ def main():
             argv += ["--gpus", args.gpus]
         if args.offload_to_cpu:
             argv += ["--offload_to_cpu"]
-        if args.save_video:
-            argv += ["--save_video"]
+        # --save_video is NOT passed to step 1: the video is written after step 2 with the species labels
         print("=" * 60 + "\nSTEP 1: SAM3 tracking\n" + "=" * 60)
         saved_argv = sys.argv
         sys.argv = argv
@@ -80,7 +80,8 @@ def main():
 
     print("\n" + "=" * 60 + "\nSTEP 2: BioCLIP species per track\n" + "=" * 60)
     ctb.run(sam3_dir, args.video_path, args.species.split(","), model=args.model,
-            max_crops_per_track=args.max_crops_per_track, min_prob=args.min_prob, batch_size=args.batch_size)
+            max_crops_per_track=args.max_crops_per_track, min_prob=args.min_prob, batch_size=args.batch_size,
+            save_video=args.save_video)
 
 
 if __name__ == "__main__":

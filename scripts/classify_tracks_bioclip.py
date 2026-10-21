@@ -57,6 +57,8 @@ def parse_args():
     p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--device", default="cuda")
     p.add_argument("--save_crops", action="store_true", help="also save every crop used as a JPEG")
+    p.add_argument("--save_video", action="store_true",
+                   help="write output_video.mp4 from the visualization frames with the species label per track")
     return p.parse_args()
 
 
@@ -215,8 +217,55 @@ def contact_sheet(crops, labels_per_crop, title, path, tile=160, cols=8):
     cv2.imwrite(path, canvas, [cv2.IMWRITE_JPEG_QUALITY, 85])
 
 
+def write_labelled_video(sam3_output_dir, results, fps, out_name="output_video.mp4"):
+    """Rebuild the overlay video from the saved visualization frames, adding each track's species label
+    (in the same colour as its mask) above the object's box. Returns the video path or None."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from process_video import create_color_map
+    vis = sorted(glob.glob(os.path.join(sam3_output_dir, "visualizations", "frame_*.jpg")))
+    if not vis:
+        print("no visualization frames found; cannot write the labelled video")
+        return None
+    colors = create_color_map(100)  # same seed as process_video.py -> same colour per object id
+    first = cv2.imread(vis[0])
+    h, w = first.shape[:2]
+    path = os.path.join(sam3_output_dir, out_name)
+    writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+    scale = max(0.5, h / 1080 * 0.9)
+    thick = max(1, int(round(scale * 2)))
+    labels = {}
+    for obj, r in results.items():
+        if r.get("species") in ("uncertain", "no usable crops"):
+            labels[obj] = f"obj_{obj} {r['species']}" + (f" ({r['best_label']} {r['confidence']:.2f})" if r.get("best_label") else "")
+        else:
+            labels[obj] = f"obj_{obj} {r['species']} {r['confidence']:.2f}"
+    print(f"\nWriting labelled video: {path}")
+    for p in vis:
+        fn = int(re.search(r"frame_(\d+)\.jpg", os.path.basename(p)).group(1))
+        frame = cv2.imread(p)
+        for obj, text in labels.items():
+            mp = os.path.join(sam3_output_dir, "masks", f"obj_{obj}", f"frame_{fn:06d}.png")
+            if not os.path.isfile(mp):
+                continue
+            mask = cv2.imread(mp, 0)
+            ys, xs = np.where(mask > 0)
+            if len(xs) == 0:
+                continue
+            x0, y0 = int(xs.min()), int(ys.min())
+            r, g, b = colors.get(obj, (255, 255, 255))
+            col = (b, g, r)  # visualization frames are RGB images read back as BGR
+            (tw, th), base = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thick)
+            ty = y0 - 8 if y0 - th - 12 > 0 else min(h - 4, int(ys.max()) + th + 8)
+            cv2.rectangle(frame, (x0, ty - th - 6), (x0 + tw + 8, ty + base), col, -1)
+            cv2.putText(frame, text, (x0 + 4, ty), cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), thick, cv2.LINE_AA)
+        writer.write(frame)
+    writer.release()
+    return path
+
+
 def run(sam3_output_dir, video_path, species, model=DEFAULT_MODEL, max_crops_per_track=24, margin=0.15,
-        min_box=32, min_prob=0.5, batch_size=8, device="cuda", save_crops=False, classifier=None):
+        min_box=32, min_prob=0.5, batch_size=8, device="cuda", save_crops=False, classifier=None,
+        save_video=False):
     species = [s.strip() for s in species if s.strip()]
     meta_path = os.path.join(sam3_output_dir, "metadata.json")
     meta = json.load(open(meta_path)) if os.path.isfile(meta_path) else {}
@@ -271,6 +320,9 @@ def run(sam3_output_dir, video_path, species, model=DEFAULT_MODEL, max_crops_per
     with open(meta_path, "w") as f:
         json.dump(meta, f, indent=2)
     print(f"\nwritten: species_per_track.json / .csv and species_obj_<k>.jpg in {sam3_output_dir}")
+    if save_video:
+        fps = meta.get("effective_fps") or meta.get("fps") or 30.0
+        write_labelled_video(sam3_output_dir, results, fps)
     return out
 
 
@@ -278,7 +330,8 @@ def main():
     args = parse_args()
     run(args.sam3_output_dir, args.video_path, args.species.split(","), model=args.model,
         max_crops_per_track=args.max_crops_per_track, margin=args.margin, min_box=args.min_box,
-        min_prob=args.min_prob, batch_size=args.batch_size, device=args.device, save_crops=args.save_crops)
+        min_prob=args.min_prob, batch_size=args.batch_size, device=args.device, save_crops=args.save_crops,
+        save_video=args.save_video)
 
 
 if __name__ == "__main__":
