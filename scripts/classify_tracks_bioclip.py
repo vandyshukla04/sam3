@@ -296,7 +296,8 @@ def write_labelled_video(sam3_output_dir, results, fps, out_name="output_video.m
     labels = {}
     for obj, r in results.items():
         if r.get("species") in ("uncertain", "no usable crops"):
-            labels[obj] = f"obj_{obj} {r['species']}" + (f" ({r['best_label']} {r['confidence']:.2f})" if r.get("best_label") else "")
+            # no species name and no number: the point of the label is that nothing was asserted
+            labels[obj] = f"obj_{obj} uncertain"
         else:
             labels[obj] = f"obj_{obj} {r['species']} {r['confidence']:.2f}"
     print(f"\nWriting labelled video: {path}")
